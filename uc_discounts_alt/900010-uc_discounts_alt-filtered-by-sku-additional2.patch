@@ -1,0 +1,33 @@
+From 6e17fe0977f3345efeddb92f2e07e8a2b81c85f7 Mon Sep 17 00:00:00 2001
+From: Ted Cooper <elc@784944.no-reply.drupal.org>
+Date: Thu, 20 Oct 2011 02:57:22 +1000
+Subject: [PATCH 2/2] by ELC: Remove yet more debugging code I had added.
+
+---
+ uc_discounts/uc_discounts.module |   10 ----------
+ 1 files changed, 0 insertions(+), 10 deletions(-)
+
+diff --git a/uc_discounts/uc_discounts.module b/uc_discounts/uc_discounts.module
+index 7212836..1e60ccf 100644
+--- a/uc_discounts/uc_discounts.module
++++ b/uc_discounts/uc_discounts.module
+@@ -1668,16 +1668,6 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+       }
+     }
+ 
+-/*
+-file_put_contents('/tmp/uc_discounts_alt_order_and_discount', print_r(array(
+-  'discount_product_ids' => $discount_product_ids,
+-  'order_product_ids' => $order_product_ids,
+-  'order_and_discount_product_ids' => $order_and_discount_product_ids,
+-  'order_and_discount_products' => $order_and_discount_products,
+-  'order_product_id_product_array_map' => $order_product_id_product_array_map,
+-), true));
+-*/
+-
+     // Amount of products to which discounts get applied
+     $discount_products_amount = 0;
+     // Quantity of products to which discounts get applied
+-- 
+1.7.2.5
+

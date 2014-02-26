@@ -1,0 +1,327 @@
+From 4fc570d0553bf31aff9c34929750bc900aa09903 Mon Sep 17 00:00:00 2001
+From: Ted Cooper <elc@784944.no-reply.drupal.org>
+Date: Thu, 20 Oct 2011 00:07:03 +1000
+Subject: [PATCH 1/2] Issue #1314744 by ELC: Use of more than one coupon of same discount for fixed price off.
+
+Add new field to schema and update function to go with it.
+Added setting to admin.inc.
+Only Fixed amount off included in exception. Entire discount process needs rewrite to deal with percentage off.
+Add main module code to support for multiple fixed price code based discounts.
+---
+ uc_discounts/uc_discounts.admin.inc |   10 +++-
+ uc_discounts/uc_discounts.install   |   16 +++++
+ uc_discounts/uc_discounts.module    |  112 ++++++++++++++++++++++------------
+ 3 files changed, 97 insertions(+), 41 deletions(-)
+
+diff --git a/uc_discounts/uc_discounts.admin.inc b/uc_discounts/uc_discounts.admin.inc
+index c064c42..235e0a1 100644
+--- a/uc_discounts/uc_discounts.admin.inc
++++ b/uc_discounts/uc_discounts.admin.inc
+@@ -373,7 +373,7 @@ function uc_discounts_form($form_state, $discount_id = 0) {
+   $form['application']['max_times_applied'] = array(
+     '#type' => 'textfield',
+     '#title' => t('Maximum applications'),
+-    '#description' => t('How many times can this discount be applied in a single cart (0 for unlimited)?  Does not apply to "Percentage off" or "Fixed amount off" discounts.'),
++    '#description' => t('How many times can this discount be applied in a single cart (0 for unlimited)?  Does not apply to "Percentage off" or "Fixed amount off" discounts unless the Maximum applications on Fixed amount off OK checkbox is ticked below. See description on that field.'),
+     '#default_value' => isset($form_state['values']['max_times_applied']) ? $form_state['values']['max_times_applied'] : 0,
+     '#size' => 7,
+     '#required' => TRUE,
+@@ -414,6 +414,13 @@ function uc_discounts_form($form_state, $discount_id = 0) {
+     '#required' => TRUE,
+   );
+ 
++  $form['application']['max_times_applied_fixed_ok'] = array(
++    '#type' => 'checkbox',
++    '#title' => t('Maximum applications on fixed amount off OK.'),
++    '#description' => t('When using codes it can be useful to have the fixed amount for a single discount be applied more than once. Fixed amount will be added together. If ticked, will simply remove the single limitation and all other figures above will be used.'),
++    '#default_value' => isset($form_state['values']['max_times_applied_fixed_ok']) ? $form_state['values']['max_times_applied_fixed_ok'] : FALSE,
++  );
++
+   $form['submit'] = array('#type' => 'submit', '#value' => t('Submit'));
+ 
+   return $form;
+@@ -680,6 +687,7 @@ function uc_discounts_form_submit($form, &$form_state) {
+   $discount->max_uses = $form_state['values']['max_uses'];
+   $discount->max_uses_per_user = $form_state['values']['max_uses_per_user'];
+   $discount->max_uses_per_code = $form_state['values']['max_uses_per_code'];
++  $discount->max_times_applied_fixed_ok = $form_state['values']['max_times_applied_fixed_ok'];
+   $discount->has_expiration = $form_state['values']['has_expiration'];
+   $discount->expiration = $expiration;
+   $discount->has_activation = $form_state['values']['has_activation'];
+diff --git a/uc_discounts/uc_discounts.install b/uc_discounts/uc_discounts.install
+index 5744b4b..bfecc81 100644
+--- a/uc_discounts/uc_discounts.install
++++ b/uc_discounts/uc_discounts.install
+@@ -112,6 +112,12 @@ function uc_discounts_schema() {
+         "default" => 1,
+         "description" => t("Number of times this discount can be applied to a single cart (0 for unlimited)."),
+       ),
++      'max_times_applied_fixed_ok' => array(
++        'type' => 'int',
++        'not null' => TRUE,
++        'default' => 0,
++        'description' => t('When ticked, the "Fixed amount off" and a code is used, the discount will be applied for each correct code.'),
++      ),
+       "limit_max_times_applied" => array(
+         "type" => "int",
+         "size" => "tiny",
+@@ -694,3 +700,13 @@ function uc_discounts_update_6006() {
+   return $ret;
+ }
+ 
++/**
++ * Optionally allow code from same discount to be used more than once on same cart.
++ */
++function uc_discounts_update_6007() {
++  $schema = uc_discounts_schema();
++  $ret = array();
++  db_add_field($ret, 'uc_discounts', 'max_times_applied_fixed_ok', $schema['uc_discounts']['fields']['max_times_applied_fixed_ok']);
++  return $ret;
++}
++
+diff --git a/uc_discounts/uc_discounts.module b/uc_discounts/uc_discounts.module
+index 36dac6c..7212836 100644
+--- a/uc_discounts/uc_discounts.module
++++ b/uc_discounts/uc_discounts.module
+@@ -591,7 +591,11 @@ function uc_checkout_pane_discounts($op, &$arg1, $arg2) {
+       // for a discount.
+       $applied_codes = array();
+       foreach ($discounts as $discount) {
+-        $applied_codes[] = $discount->code;
++        if (is_array($discount->code)) {
++          foreach ($discount->code as $code) {
++            $applied_codes[] = $code;
++          }
++        }
+       }
+       $arg1->uc_discounts_codes = $applied_codes;
+ 
+@@ -1384,15 +1388,18 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+     }
+ 
+     //Get code for discount (if one exists)
+-    // @todo LEEP multiple codes per discount if configured
++    // multiple codes per discount if configured
+     $discount->code = NULL;
+     if (!empty($escaped_codes_string)) {
+-      $query = sprintf("SELECT code FROM {uc_discounts_codes} WHERE code IN(%s) AND discount_id=%d",
++      $query = sprintf('SELECT code FROM {uc_discounts_codes} WHERE code IN (%s) AND discount_id = %d',
+         $escaped_codes_string, $discount->discount_id
+       );
+-      $row = db_fetch_array(db_query($query));
+-      if (!empty($row)) {
+-        $discount->code = $row["code"];
++      $code_result = db_query($query);
++      while ($row = db_fetch_array($code_result)) {
++        $discount->code[] = $row['code'];
++      }
++      if (count($discount->code) > 1 && !($discount->discount_type == DISCOUNT_TYPE_FIXED_AMOUNT_OFF && $discount->max_times_applied_fixed_ok)) {
++        $discount->code = array($discount->code[0]);
+       }
+     }
+ 
+@@ -1404,20 +1411,18 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+ 
+     //If this discount has a max uses amount, check max uses
+     if ($discount->max_uses > 0) {
+-      $row = db_fetch_array(db_query("SELECT COUNT(*) as uses_count FROM {uc_discounts_uses} WHERE discount_id=%d",
++      $row = db_fetch_array(db_query('SELECT COUNT(*) as uses_count FROM {uc_discounts_uses} WHERE discount_id = %d',
+           $discount->discount_id
+         ));
+       if ($row["uses_count"] >= $discount->max_uses) {
+         //If this is a coded discount, add error message
+         if (!is_null($warnings) && !is_null($discount->code)) {
+           $warnings[] = t('The discount for code "@code" has reached its maximum number of uses.',
+-            array("@code" => $discount->code)
++            array('@code' => implode(',', $discount->code))
+           );
+         }
+         continue;
+       }
+-
+-      $discount->uses_count = $row["uses_count"];
+     }
+ 
+     //If this discount has a max uses per user amount, check max uses per user
+@@ -1429,31 +1434,37 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+         //If this is a coded discount, add warning message
+         if (!is_null($warnings) && !is_null($discount->code)) {
+           $warnings[] = t('The discount for code "@code" has reached its maximum number of uses.',
+-            array("@code" => $discount->code)
++            array('@code' => implode(',', $discount->code))
+           );
+         }
+         continue;
+       }
+-
+-      $discount->user_uses_count = $row["user_uses_count"];
+     }
+ 
+     //If code exists and this discount has a max uses per code amount, check max uses per code
+     if (!is_null($discount->code) && ($discount->max_uses_per_code > 0)) {
+-      $row = db_fetch_array(db_query("SELECT COUNT(*) as code_uses_count FROM {uc_discounts_uses} WHERE discount_id=%d AND code='%s'",
+-          $discount->discount_id, $discount->code
+-        ));
+-      if ($row["code_uses_count"] >= $discount->max_uses_per_code) {
+-        //Add warning message
+-        if (!is_null($warnings)) {
+-          $warnings[] = t('The discount code "@code" has reached its max number of uses.',
+-            array("@code" => $discount->code)
+-          );
++      foreach ($discount->code as $i => $code) {
++        $row = db_fetch_array(db_query("SELECT COUNT(*) as code_uses_count FROM {uc_discounts_uses} WHERE discount_id = %d AND code = '%s'",
++            $discount->discount_id, db_escape_string($code)
++          ));
++        if ($row['code_uses_count'] >= $discount->max_uses_per_code) {
++          // Add warning message
++          if (!is_null($warnings)) {
++            $warnings[] = t('The discount code "@code" has reached its max number of uses.',
++              array('@code' => $code)
++            );
++          }
++          // Remove from codes because it is invalid.
++          unset($discount->code[$i]);
++          continue;
+         }
+-        continue;
+       }
+ 
+-      $discount->code_uses_count = $row["code_uses_count"];
++      // Check to see if any codes are left to use.
++      if (empty($discount->code)) {
++        $discount->code = NULL;
++        continue;
++      }
+     }
+ 
+     //If there are applied discounts, check if discount is being combined and can be combined
+@@ -1462,7 +1473,7 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+         //If this is a coded discount, add error message
+         if (!is_null($warnings) && !is_null($discount->code)) {
+           $warnings[] = t('The discount for code "@code" cannot be combined with other discounts.',
+-            array("@code" => $discount->code)
++            array('@code' => implode(',', $discount->code))
+           );
+         }
+         continue;
+@@ -1474,7 +1485,7 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+         //discounts have codes)
+         if (!is_null($warnings) && !empty($discounts[0]->code) && !is_null($discount->code)) {
+           $warnings[] = t('The discount for code "@code" cannot be combined with other discounts.',
+-            array("@code" => $discounts[0]->code)
++            array('@code' => implode(',', $discounts[0]->code))
+           );
+         }
+         continue;
+@@ -1511,7 +1522,7 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+     }
+     if (!empty($discount->code) && $required_are_missing) {
+       $warnings[] = t('The discount for code "@code" requires a product that is not in your cart.',
+-                      array('@code' => $discount->code));
++                      array('@code' => implode(',', $discount->code)));
+       continue;
+     }
+ 
+@@ -1594,13 +1605,13 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+           case QUALIFYING_TYPE_MINIMUM_PRICE:
+             $qualifying_amount = uc_currency_format($discount->qualifying_amount);
+             $warnings[] = t('The discount for code "@code" requires a minimum amount of @qualifying_amount to qualify.',
+-              array("@code" => $discount->code, "@qualifying_amount" => $qualifying_amount)
++              array('@code' => implode(',', $discount->code), '@qualifying_amount' => $qualifying_amount)
+             );
+             break;
+ 
+           case QUALIFYING_TYPE_MINIMUM_QUANTITY:
+             $warnings[] = t('The discount for code "@code" requires a minimum quantity of @qualifying_amount to qualify.',
+-              array("@code" => $discount->code, "@qualifying_amount" => $discount->qualifying_amount)
++              array('@code' => implode(',', $discount->code), '@qualifying_amount' => $discount->qualifying_amount)
+             );
+             break;
+         }
+@@ -1616,13 +1627,13 @@ function get_discounts_for_order($order, &$errors = NULL, &$warnings = NULL, &$m
+         switch ($discount->qualifying_type) {
+           case QUALIFYING_TYPE_MINIMUM_PRICE:
+             $warnings[] = t('The discount for code "@code" cannot exceed the price of @qualifying_amount_max to qualify.',
+-              array("@code" => $discount->code, "@qualifying_amount_max" => $qualifying_amount_max)
++              array('@code' => implode(',', $discount->code), '@qualifying_amount_max' => $qualifying_amount_max)
+             );
+             break;
+ 
+           case QUALIFYING_TYPE_MINIMUM_QUANTITY:
+             $warnings[] = t('The discount for code "@code" cannot exceed the quantity of @qualifying_amount_max to qualify.',
+-              array("@code" => $discount->code, "@qualifying_amount_max" => $discount->qualifying_amount_max)
++              array("@code" => implode(',', $discount->code), '@qualifying_amount_max' => $discount->qualifying_amount_max)
+             );
+             break;
+         }
+@@ -1827,9 +1838,15 @@ file_put_contents('/tmp/uc_discounts_alt_order_and_discount', print_r(array(
+         break;
+ 
+       case DISCOUNT_TYPE_FIXED_AMOUNT_OFF:
+-        // Always apply once since it applies to the whole order
+-        $discount->times_applied = 1;
+-        $discount->amount = $discount->discount_amount;
++        // Always apply once since it applies to the whole order, unless overriden to
++        // work with codes.
++        if ($discount->max_times_applied_fixed_ok && !is_null($discount->code)) {
++          $discount->times_applied = count($discount->code);
++        }
++        else {
++          $discount->times_applied = 1;
++        }
++        $discount->amount = $discount->discount_amount * $discount->times_applied;
+         break;
+ 
+       case DISCOUNT_TYPE_FIXED_AMOUNT_OFF_PER_QUALIFYING_ITEM:
+@@ -1839,7 +1856,7 @@ file_put_contents('/tmp/uc_discounts_alt_order_and_discount', print_r(array(
+ 
+     if (!is_null($messages)) {
+       $options = array("@short_description" => $discount->short_description,
+-        "@code" => $discount->code,
++        "@code" => implode(',', $discount->code),
+         "@times_applied" => $discount->times_applied,
+         "@discount_amount" => uc_currency_format($discount->amount),
+         "@time_string" => $time_string,
+@@ -2088,7 +2105,6 @@ function uc_discounts_uses_save_for_order($order) {
+ 
+   // Insert uses (for best results use discounts returned by call to get_discounts_for_order)
+   foreach ($discounts as $discount) {
+-    $code          = (!empty($discount->code)) ? $discount->code : '';
+     $times_applied = (is_numeric($discount->times_applied)) ? $discount->times_applied : 1;
+     $amount        = (is_numeric($discount->amount)) ? $discount->amount : 0;
+ 
+@@ -2096,11 +2112,27 @@ function uc_discounts_uses_save_for_order($order) {
+     $discount_use->discount_id = $discount->discount_id;
+     $discount_use->user_id = $order->uid;
+     $discount_use->order_id = $order->order_id;
+-    $discount_use->code = $code;
+-    $discount_use->times_applied = $times_applied;
+-    $discount_use->amount = $amount;
+     $discount_use->insert_timestamp = time();
+-    drupal_write_record('uc_discounts_uses', $discount_use);
++
++    $has_codes = false;
++    if (is_array($discount->code) && count($discount->code)) {
++      $has_codes = true;
++    } else {
++      $discount->code = array('');
++    }
++    foreach ($discount->code as $code) {
++      if ($discount->discount_type == DISCOUNT_TYPE_FIXED_AMOUNT_OFF && $discount->max_times_applied_fixed_ok && $has_codes) {
++        $times_applied = 1;
++        $adjusted_amount = $discount->discount_amount;
++      } else {
++        $adjusted_amount = $amount;
++      }
++
++      $discount_use->code = $code;
++      $discount_use->amount = $adjusted_amount;
++      $discount_use->times_applied = $times_applied;
++      drupal_write_record('uc_discounts_uses', $discount_use);
++    }
+   }
+ }
+ 
+-- 
+1.7.2.5
+
